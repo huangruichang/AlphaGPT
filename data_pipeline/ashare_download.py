@@ -1,6 +1,9 @@
 """
-Download A-share stock basic info and daily OHLCV data via akshare,
+Download A-share stock basic info and daily OHLCV data via akshare or tushare,
 then write into PostgreSQL tables defined in ashare_db.py.
+
+Tushare is used as the primary data source (more stable than akshare).
+Akshare is kept as a fallback.
 
 Usage:
     python -m data_pipeline.ashare_download          # default: HS300 + ZZ500
@@ -9,7 +12,10 @@ Usage:
 
 import argparse
 import datetime as dt
+import os
+import time
 from typing import List
+from typing import Optional
 
 import akshare as ak
 import pandas as pd
@@ -19,6 +25,31 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data_pipeline.ashare_db import SessionLocal, StockBasic, Daily, engine
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+# ------------------------------------------------------------------
+# Tushare initialisation (primary data source)
+# ------------------------------------------------------------------
+# Read token from environment variable TUSHARE_TOKEN (set in .env)
+_TUSHARE_TOKEN = os.environ.get("TUSHARE_TOKEN", "")
+_tushare_pro: Optional[object] = None
+_tushare_available: bool = False
+
+if _TUSHARE_TOKEN:
+    try:
+        import tushare as ts
+        ts.set_token(_TUSHARE_TOKEN)
+        _tushare_pro = ts.pro_api()
+        _tushare_available = True
+        print("[init] Tushare initialised successfully.")
+    except Exception as e:
+        print(f"[init] Tushare initialisation failed: {e}. Will use akshare as fallback.")
+else:
+    print("[init] TUSHARE_TOKEN not set in environment. Will use akshare only.")
+
+
+def _tushare_enabled() -> bool:
+    """Return True if tushare pro API is available."""
+    return _tushare_available and _tushare_pro is not None
 
 
 # ------------------------------------------------------------------
@@ -39,13 +70,63 @@ def get_zz500_codes() -> List[str]:
 
 def get_top500_by_mcap() -> List[str]:
     """
-    Return ts_code list of A-share stocks ranked by market cap
-    (fallback when index constituent APIs are unavailable).
+    Return ts_code list of top A-share stocks by market cap.
+    
+    Since ak.stock_zh_a_spot_em() is unreliable (connection issues),
+    we use index constituents as a proxy for top stocks:
+    - ZZ800 (HS300 + ZZ500) = 800 stocks
+    - SSE50 = 50 stocks  
+    - STAR50 = 50 stocks
+    This gives us ~800-900 stocks covering most of the market cap.
     """
-    today = dt.date.today().strftime("%Y%m%d")
-    df = ak.stock_zh_a_spot_em()
-    df = df.sort_values("总市值", ascending=False).head(500)
-    return df["代码"].apply(_to_ts_code).tolist()
+    import time
+    
+    print("  Fetching stock list from major indices (ZZ800 + SSE50 + STAR50) ...")
+    
+    all_codes = set()
+    
+    # Helper to fetch index with retry
+    def fetch_index(symbol: str, name: str) -> set:
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                df = ak.index_stock_cons_csindex(symbol=symbol)
+                codes = set(df["成分券代码"].tolist())
+                print(f"    {name}: {len(codes)} stocks")
+                return codes
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    print(f"    {name}: retry {attempt + 1}/{max_retries} after error: {str(e)[:50]}")
+                    time.sleep(2)
+                else:
+                    print(f"    {name}: failed after {max_retries} retries: {str(e)[:50]}")
+                    return set()
+    
+    # Fetch from major indices
+    # ZZ800 = HS300 + ZZ500 (covers top 800 by market cap)
+    all_codes.update(fetch_index("000906", "ZZ800"))
+    
+    # SSE50 (Shanghai Stock Exchange 50) - large cap
+    all_codes.update(fetch_index("000016", "SSE50"))
+    
+    # STAR50 (Science and Technology Innovation Board 50) - top STAR stocks
+    all_codes.update(fetch_index("000688", "STAR50"))
+    
+    if len(all_codes) == 0:
+        print("  Warning: All index APIs failed, falling back to all A-share stocks ...")
+        try:
+            df_all = ak.stock_info_a_code_name()
+            all_codes = set(df_all["code"].tolist())
+            print(f"    Got {len(all_codes)} stocks from stock_info_a_code_name()")
+        except Exception as e:
+            print(f"  Error: Failed to fetch stock list: {e}")
+            raise
+    
+    # Convert to ts_code format
+    result = [_to_ts_code(code) for code in all_codes]
+    print(f"  Total unique stocks: {len(result)}")
+    
+    return result
 
 
 def get_stock_pool(use_index: bool = True) -> List[str]:
@@ -53,8 +134,8 @@ def get_stock_pool(use_index: bool = True) -> List[str]:
     Parameters
     ----------
     use_index : bool
-        True  -> HS300 ∪ ZZ500
-        False -> top 500 by market cap
+        True  -> HS300 ∪ ZZ500 (default, ~600 stocks)
+        False -> Top stocks by market cap via index constituents (ZZ800 + SSE50 + STAR50, ~800-900 stocks)
     """
     if use_index:
         codes = set(get_hs300_codes())
@@ -67,63 +148,175 @@ def get_stock_pool(use_index: bool = True) -> List[str]:
 # 2. Download helpers
 # ------------------------------------------------------------------
 
+def download_stock_basic_tushare(ts_codes: List[str]) -> pd.DataFrame:
+    """
+    Fetch stock_basic info from tushare pro API.
+
+    Tushare stock_basic returns:
+        ts_code, symbol, name, area, industry, market, list_date, list_status
+    """
+    if not _tushare_enabled():
+        raise RuntimeError("Tushare is not available. Set TUSHARE_TOKEN in .env")
+
+    print("  Fetching stock basic info from tushare ...")
+    # Tushare limits: max 5000 rows per call; we may need multiple calls
+    # But stock_basic with list_status='L' returns all listed stocks at once
+    df = _tushare_pro.stock_basic(
+        exchange="",
+        list_status="L",
+        fields="ts_code,symbol,name,area,industry,market,list_date,list_status",
+    )
+    df["ts_code"] = df["ts_code"].str.strip()
+    df_pool = df[df["ts_code"].isin(ts_codes)].copy()
+
+    # Ensure all required columns exist
+    for col in ["symbol", "name", "industry", "area", "list_status", "market", "list_date"]:
+        if col not in df_pool.columns:
+            df_pool[col] = None
+
+    print(f"  Got {len(df_pool)} stocks from tushare")
+    return df_pool
+
+
 def download_stock_basic(ts_codes: List[str]) -> pd.DataFrame:
     """
-    Fetch stock_basic info from akshare bulk APIs.
-
-    Uses:
-      - stock_info_a_code_name()       : code → name mapping
-      - stock_individual_info_em(code) : per-stock industry/area/list_date
-        (called in batch; for large pools consider stock_a_lg_indicator() as a
-        faster alternative if available in your akshare version)
+    Fetch stock_basic info.
+    Try tushare first (more stable), fall back to akshare if tushare fails.
     """
-    # Bulk code → name
+    if _tushare_enabled():
+        try:
+            return download_stock_basic_tushare(ts_codes)
+        except Exception as e:
+            print(f"  [WARN] Tushare download_stock_basic failed: {e}. Falling back to akshare ...")
+
+    # Fallback to akshare
+    print("  Fetching stock code → name mapping (akshare) ...")
     df_all = ak.stock_info_a_code_name()
     df_all["ts_code"] = df_all["code"].apply(_to_ts_code)
     df_pool = df_all[df_all["ts_code"].isin(ts_codes)].copy()
     df_pool = df_pool.rename(columns={"code": "symbol", "name": "name"})
 
-    # Bulk industry / area via stock_a_industry_name_em (covers entire market)
-    try:
-        df_ind = ak.stock_a_industry_name_em()
-        df_ind["ts_code"] = df_ind["code"].apply(_to_ts_code)
-        df_pool = df_pool.merge(
-            df_ind[["ts_code", "industry", "area"]],
-            on="ts_code",
-            how="left",
-        )
-    except Exception:
-        # fallback: leave industry/area empty
-        pass
+    # Try to get industry/area info using available akshare APIs
+    # Note: stock_a_industry_name_em() does not exist in akshare v1.18+
+    # We'll leave industry/area empty for now
+    print("  Note: industry/area info not fetched (API unavailable in current akshare version)")
+    df_pool["industry"] = None
+    df_pool["area"] = None
 
     df_pool["list_status"] = "L"
-    df_pool["market"] = df_pool.get("market", "")
+    df_pool["market"] = ""
+    df_pool["list_date"] = None
+
+    # Ensure all required columns exist
+    for col in ["symbol", "name", "industry", "area", "list_status", "market", "list_date"]:
+        if col not in df_pool.columns:
+            df_pool[col] = None
+
     return df_pool
 
 
-def _retry_akshare(func, retries: int = 3, delay: float = 2.0):
-    """Call func(); on ConnectionError retry with sleep."""
-    import time
+def _retry_akshare(func, retries: int = 8, delay: float = 5.0):
+    """
+    Call func(); on exception retry with exponential backoff + random jitter.
+
+    Parameters
+    ----------
+    retries : int
+        Max retry attempts (default 8).
+    delay : float
+        Initial delay in seconds (default 5.0).
+        Each subsequent retry doubles the delay (exponential backoff).
+    """
+    import time, random
     for i in range(retries):
         try:
             return func()
         except Exception as e:
             if i == retries - 1:
                 raise
-            print(f"    retry {i+1}/{retries} after: {e}")
-            time.sleep(delay)
+            # Exponential backoff: delay * 2^i, with random jitter ±25%
+            backoff = delay * (2 ** i)
+            jitter = backoff * random.uniform(-0.25, 0.25)
+            sleep_time = max(delay, backoff + jitter)
+            print(f"    retry {i+1}/{retries} after {sleep_time:.1f}s: {e}")
+            time.sleep(sleep_time)
 
 
-def download_daily(ts_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+def download_daily_tushare(ts_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """
+    Download daily OHLCV for one stock via tushare pro API.
+
+    Tushare daily returns:
+        ts_code, trade_date, open, high, low, close, pre_close,
+        change, pct_chg, vol, amount
+
+    Parameters
+    ----------
+    ts_code : str  e.g. '600519.SH'
+    start_date : str  'YYYYMMDD'
+    end_date : str  'YYYYMMDD'
+    """
+    if not _tushare_enabled():
+        raise RuntimeError("Tushare is not available. Set TUSHARE_TOKEN in .env")
+
+    df = _tushare_pro.daily(
+        ts_code=ts_code,
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+    if df.empty:
+        return pd.DataFrame()
+
+    # Tushare returns trade_date as 'YYYYMMDD' string; convert to date
+    df["trade_date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d").dt.date
+
+    # Ensure numeric types
+    numeric_cols = ["open", "high", "low", "close", "pre_close", "change", "pct_chg",
+                    "vol", "amount"]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Columns expected by the daily table; fill missing with None
+    keep = [
+        "ts_code", "trade_date",
+        "open", "high", "low", "close",
+        "pre_close", "change", "pct_chg",
+        "vol", "amount",
+        "turnover_rate", "volume_ratio",
+        "pe", "pb",
+    ]
+    for c in keep:
+        if c not in df.columns:
+            df[c] = None
+
+    return df[keep]
+
+
+def download_daily(ts_code: str, start_date: str, end_date: str,
+                   between_delay: float = 1.5) -> pd.DataFrame:
     """
     Download daily OHLCV for one stock.
-    ts_code format: '600519.SH' -> pass '600519' to akshare.
+    Try tushare first (more stable), fall back to akshare if tushare fails.
 
-    akshare stock_zh_a_hist returns (v1.18+):
-        日期, 股票代码, 开盘, 收盘, 最高, 最低, 成交量, 成交额, 振幅, 涨跌幅, 涨跌额, 换手率
-    pe / pb / 量比 are NOT in this call — left as NULL.
-    pre_close is derived from the previous row's close.
+    Parameters
+    ----------
+    between_delay : float
+        Seconds to sleep after each API call to avoid rate limiting (default 1.5).
+        Only used for akshare fallback.
     """
+    if _tushare_enabled():
+        try:
+            df = download_daily_tushare(ts_code, start_date, end_date)
+            if not df.empty:
+                return df
+            # Empty result from tushare, try akshare
+        except Exception as e:
+            print(f"  [WARN] Tushare download_daily failed for {ts_code}: {e}. "
+                  f"Falling back to akshare ...")
+
+    # Fallback to akshare
     symbol = ts_code[:6]
     try:
         df = _retry_akshare(
@@ -136,8 +329,13 @@ def download_daily(ts_code: str, start_date: str, end_date: str) -> pd.DataFrame
             )
         )
     except Exception as e:
-        print(f"  [WARN] {ts_code}: daily download failed after retries: {e}")
+        print(f"  [ERROR] {ts_code} (symbol={symbol}): "
+              f"stock_zh_a_hist() failed after all retries. "
+              f"start={start_date}, end={end_date}, error: {e}")
         return pd.DataFrame()
+    finally:
+        # Always sleep after API call to avoid overwhelming the server
+        time.sleep(between_delay)
 
     if df.empty:
         return pd.DataFrame()
@@ -301,14 +499,29 @@ def main(use_index: bool = True, days_back: int = 730):
 
     # --- Daily OHLCV ---
     print(f"Downloading daily data ({start_str} → {end_str}) …")
+    print(f"  Total stocks to download: {len(ts_codes)}")
+    print(f"  Rate limit: ~1.5s between requests, pause 15s every 10 stocks")
+    batch_size = 10
+    pause_seconds = 15
+    failed_stocks = []
     for i, ts_code in enumerate(ts_codes, 1):
         print(f"  [{i}/{len(ts_codes)}] {ts_code} …")
         df_daily = download_daily(ts_code, start_str, end_str)
         if df_daily.empty:
+            failed_stocks.append(ts_code)
             continue
         upsert_daily(df_daily)
+        # Pause every batch_size stocks to avoid rate limiting
+        if i % batch_size == 0 and i < len(ts_codes):
+            print(f"  [...] Pausing {pause_seconds}s after {i} stocks "
+                  f"({len(ts_codes) - i} remaining) …")
+            time.sleep(pause_seconds)
 
-    print("Done.")
+    print(f"Daily data download complete. "
+          f"Failed: {len(failed_stocks)}/{len(ts_codes)}")
+    if failed_stocks:
+        print(f"  Failed stocks: {failed_stocks[:20]}"
+              f"{'...' if len(failed_stocks) > 20 else ''}")
 
 
 # ------------------------------------------------------------------

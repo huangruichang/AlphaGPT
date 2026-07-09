@@ -192,7 +192,11 @@ class LoopedTransformerLayer(nn.Module):
         for _ in range(self.num_loops):
             # Self-attention with residual
             x_norm = self.norm1(x)
-            attn_out, _ = self.attention(x_norm, x_norm, x_norm, attn_mask=mask, is_causal=is_causal)
+            # Note: PyTorch >= 2.0 only allows either attn_mask OR is_causal
+            if mask is not None:
+                attn_out, _ = self.attention(x_norm, x_norm, x_norm, attn_mask=mask)
+            else:
+                attn_out, _ = self.attention(x_norm, x_norm, x_norm, is_causal=is_causal)
             x = x + self.dropout(attn_out)
             
             # FFN with residual

@@ -1,9 +1,12 @@
 """
 A-share Alpha Mining Pipeline — Master Run Script
 
+Data source: Tushare (primary, requires TUSHARE_TOKEN in .env)
+             Akshare (fallback if tushare is unavailable)
+
 Usage:
     python run_ashare.py --step db        # Create database tables
-    python run_ashare.py --step download  # Download A-share data via akshare
+    python run_ashare.py --step download  # Download A-share data via tushare/akshare
     python run_ashare.py --step train     # Run factor mining (engine.py)
     python run_ashare.py --step all       # Run all steps in sequence
 
@@ -12,6 +15,11 @@ Examples:
     python run_ashare.py --step download --all   # download top-500 by market cap
     python run_ashare.py --step download --days 365
     python run_ashare.py --step all --days 1095
+
+Setup:
+    1. Register at https://tushare.pro/register (free)
+    2. Get your token at https://tushare.pro/user/token
+    3. Add to .env: TUSHARE_TOKEN=your_token_here
 """
 
 import argparse

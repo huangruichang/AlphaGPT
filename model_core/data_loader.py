@@ -115,27 +115,39 @@ class CryptoDataLoader:
         conn = psycopg2.connect(ModelConfig.DB_URL)
         cur = conn.cursor(cursor_factory=RealDictCursor)
 
-        # 1. stock list ---------------------------------------------------
+        # 1. 从 daily 表获取股票列表（因为需要有日线数据才能训练）
         cur.execute("""
-            SELECT ts_code
-            FROM   stock_basic
-            WHERE  market IN ('主板','创业板','科创板')
+            SELECT DISTINCT ts_code
+            FROM   daily
             ORDER  BY ts_code
         """)
         codes = [r["ts_code"] for r in cur.fetchall()]
+        
         if self.limit:
             codes = codes[:self.limit]
-        print(f"[DataLoader] Querying {len(codes)} A-share stocks …")
-
+        
+        print(f"[DataLoader] Querying {len(codes)} A-share stocks (from daily table)…")
+        
         # 2. daily bars ---------------------------------------------------
-        # Use ANY($1) with a list; for large universes batch the query.
-        cur.execute("""
-            SELECT ts_code, trade_date, open, high, low, close, vol, amount
-            FROM   daily
-            WHERE  ts_code = ANY(%s)
-            ORDER  BY ts_code, trade_date
-        """, (codes,))
-        rows = cur.fetchall()
+        # 使用 IN 而不是 ANY（兼容性更好）
+        if len(codes) > 0:
+            # 分批查询（如果股票数量很多）
+            batch_size = 100
+            rows = []
+            
+            for i in range(0, len(codes), batch_size):
+                batch = codes[i:i+batch_size]
+                cur.execute("""
+                    SELECT ts_code, trade_date, open, high, low, close, vol, amount
+                    FROM   daily
+                    WHERE  ts_code IN %s
+                    ORDER  BY ts_code, trade_date
+                """, (tuple(batch),))
+                rows.extend(cur.fetchall())
+        else:
+            rows = []
+        
+        print(f"[DataLoader] Loaded {len(rows)} daily bars")
         conn.close()
 
         # 3. reshape ------------------------------------------------------
@@ -158,9 +170,19 @@ class CryptoDataLoader:
             rec["volume"].append(float(row["vol"]) * 100.0)
 
         # convert to arrays ------------------------------------------------
-        for code, rec in self.raw_data_cache.items():
+        valid_codes = []
+        for code, rec in list(self.raw_data_cache.items()):
+            # 检查数据是否有效
+            if len(rec["close"]) < 2:
+                print(f"[DataLoader] Warning: {code} has only {len(rec['close'])} bars, skipping")
+                del self.raw_data_cache[code]
+                continue
+            
             for k in ("open", "high", "low", "close", "volume"):
                 rec[k] = np.array(rec[k], dtype=np.float32)
+            valid_codes.append(code)
+        
+        print(f"[DataLoader] Valid stocks after filtering: {len(valid_codes)}")
 
     # ------------------------------------------------------------------ #
     #  internals – targets & features
@@ -221,7 +243,8 @@ class CryptoDataLoader:
         feat_all = self.engineer.compute_features(raw)
 
         # drop last timestep → (n_stocks, hist_len-1, input_dim)
-        self.feat_tensor = torch.from_numpy(feat_all[:, :-1, :]).float()
+        # Note: feat_all is already a Tensor (not numpy array)
+        self.feat_tensor = feat_all[:, :-1, :].float()
 
         # price_tensor: truncated close series for each stock
         close_mat = np.zeros((len(stocks), hist_len), dtype=np.float32)

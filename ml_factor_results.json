@@ -1,0 +1,26 @@
+{
+  "test_ic": 0.958401051636618,
+  "test_r2": 0.9183078508045236,
+  "top_features": [
+    {
+      "feature": "factor_0",
+      "importance": 0.6260026498577956
+    },
+    {
+      "feature": "factor_5",
+      "importance": 0.27427809017197763
+    },
+    {
+      "feature": "factor_10",
+      "importance": 0.0678701542555941
+    },
+    {
+      "feature": "factor_19",
+      "importance": 0.0021235431056692744
+    },
+    {
+      "feature": "factor_4",
+      "importance": 0.002033516475997123
+    }
+  ]
+}
